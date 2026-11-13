@@ -5,13 +5,14 @@
 // factory, which holds the contextual instance information that
 // allows multiple loggers of the same type to perform different
 // actions, such as logging to different locations.
-package logger // import "github.com/docker/docker/daemon/logger"
+package logger
 
 import (
+	"context"
 	"sync"
 	"time"
 
-	"github.com/docker/docker/api/types/backend"
+	"github.com/moby/moby/v2/daemon/server/backend"
 )
 
 // ErrReadLogsNotSupported is returned when the underlying log driver does not support reading
@@ -28,7 +29,7 @@ const (
 	logWatcherBufferSize = 4096
 )
 
-var messagePool = &sync.Pool{New: func() interface{} { return &Message{Line: make([]byte, 0, 256)} }}
+var messagePool = &sync.Pool{New: func() any { return &Message{Line: make([]byte, 0, 256)} }}
 
 // NewMessage returns a new message from the message sync.Pool
 func NewMessage() *Message {
@@ -49,20 +50,12 @@ func PutMessage(msg *Message) {
 // Message is subtyped from backend.LogMessage because there is a lot of
 // internal complexity around the Message type that should not be exposed
 // to any package not explicitly importing the logger type.
-//
-// Any changes made to this struct must also be updated in the `reset` function
 type Message backend.LogMessage
 
 // reset sets the message back to default values
 // This is used when putting a message back into the message pool.
-// Any changes to the `Message` struct should be reflected here.
 func (m *Message) reset() {
-	m.Line = m.Line[:0]
-	m.Source = ""
-	m.Attrs = nil
-	m.PLogMetaData = nil
-
-	m.Err = nil
+	*m = Message{Line: m.Line[:0]}
 }
 
 // AsLogMessage returns a pointer to the message as a pointer to
@@ -73,6 +66,8 @@ func (m *Message) AsLogMessage() *backend.LogMessage {
 
 // Logger is the interface for docker logging drivers.
 type Logger interface {
+	// The logger takes ownership of the Message on success. The caller
+	// retains ownership of the Message if an error is returned.
 	Log(*Message) error
 	Name() string
 	Close() error
@@ -95,8 +90,8 @@ type ReadConfig struct {
 
 // LogReader is the interface for reading log messages for loggers that support reading.
 type LogReader interface {
-	// Read logs from underlying logging backend
-	ReadLogs(ReadConfig) *LogWatcher
+	// ReadLogs reads logs from underlying logging backend.
+	ReadLogs(context.Context, ReadConfig) *LogWatcher
 }
 
 // LogWatcher is used when consuming logs read from the LogReader interface.
@@ -105,8 +100,6 @@ type LogWatcher struct {
 	Msg chan *Message
 	// For sending error messages that occur while reading logs.
 	Err          chan error
-	producerOnce sync.Once
-	producerGone chan struct{}
 	consumerOnce sync.Once
 	consumerGone chan struct{}
 }
@@ -116,24 +109,8 @@ func NewLogWatcher() *LogWatcher {
 	return &LogWatcher{
 		Msg:          make(chan *Message, logWatcherBufferSize),
 		Err:          make(chan error, 1),
-		producerGone: make(chan struct{}),
 		consumerGone: make(chan struct{}),
 	}
-}
-
-// ProducerGone notifies the underlying log reader that
-// the logs producer (a container) is gone.
-func (w *LogWatcher) ProducerGone() {
-	// only close if not already closed
-	w.producerOnce.Do(func() {
-		close(w.producerGone)
-	})
-}
-
-// WatchProducerGone returns a channel receiver that receives notification
-// once the logs producer (a container) is gone.
-func (w *LogWatcher) WatchProducerGone() <-chan struct{} {
-	return w.producerGone
 }
 
 // ConsumerGone notifies that the logs consumer is gone.
@@ -157,6 +134,3 @@ type Capability struct {
 	// Determines if a log driver can read back logs
 	ReadLogs bool
 }
-
-// MarshalFunc is a func that marshals a message into an arbitrary format
-type MarshalFunc func(*Message) ([]byte, error)
